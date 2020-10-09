@@ -1,18 +1,40 @@
 import Event from '../events';
-import EventHandler from '../event-handler';
+import TaskLoop from '../task-loop';
 import { logger } from '../utils/logger';
 import { computeReloadInterval } from './level-helper';
-import { clearCurrentCues } from '../utils/texttrack-utils';
+import { clearCurrentCues, filterSubtitleTracks } from '../utils/texttrack-utils';
+import { ErrorDetails, ErrorTypes } from '../errors';
 
-class SubtitleTrackController extends EventHandler {
+/**
+ * Subtitle-track-controller, handles states of text-track selection combining user API inputs,
+ * manifest default selection and current level group-ID running.
+ *
+ * @class
+ */
+class SubtitleTrackController extends TaskLoop {
   constructor (hls) {
     super(hls,
+      Event.ERROR,
       Event.MEDIA_ATTACHED,
       Event.MEDIA_DETACHING,
       Event.MANIFEST_LOADED,
+      Event.LEVEL_LOADED,
       Event.SUBTITLE_TRACK_LOADED);
+
+    /**
+     * @member {SubtitleTrack[]}
+     */
     this.tracks = [];
+
+    /**
+     * Currently selected track index
+     * @member {number}
+     */
     this.trackId = -1;
+
+    /**
+     * @member {HTMLMediaElement}
+     */
     this.media = null;
     this.stopped = true;
 
@@ -26,10 +48,38 @@ class SubtitleTrackController extends EventHandler {
      * @member {number}
      */
     this.queuedDefaultTrack = null;
+
+    /**
+     * @public
+     * Flag hash of restricted track IDs (that have caused failure)
+     * @member {{[id: number] => boolean}}
+     */
+    this.restrictedTracks = Object.create(null);
+
+    /**
+     * @private
+     * The currently running group ID for text (CC)
+     * (we grab this on manifest-parsed and new level-loaded)
+     * @member {string}
+     */
+    this._subtitleGroupId = null;
+
+    /**
+     * Stores the selected track before media has been attached
+     * @private {SubtitleTrack | null}
+     */
+    this._queuedDefaultTrack = null;
+
+    /**
+     * If should select tracks according to default track attribute
+     * @private
+     * @member {boolean} selectDefaultTrack
+     */
+    this._selectDefaultTrack = true;
   }
 
-  destroy () {
-    EventHandler.prototype.destroy.call(this);
+  doTick () {
+    this._loadCurrentTrack();
   }
 
   // Listen for subtitle track change, then extract the current track ID.
@@ -39,9 +89,9 @@ class SubtitleTrackController extends EventHandler {
       return;
     }
 
-    if (Number.isFinite(this.queuedDefaultTrack)) {
-      this.subtitleTrack = this.queuedDefaultTrack;
-      this.queuedDefaultTrack = null;
+    if (this.queuedDefaultTrack !== null && Number.isFinite(this.queuedDefaultTrack)) {
+      this._setSubtitleTrack(this._queuedDefaultTrack);
+      this._queuedDefaultTrack = null;
     }
 
     this.trackChangeListener = this._onTextTracksChanged.bind(this);
@@ -81,6 +131,24 @@ class SubtitleTrackController extends EventHandler {
     this.media = null;
   }
 
+  onLevelLoaded (data) {
+    const levelInfo = this.hls.levels[data.level];
+
+    if (!levelInfo.subtitleGroupIds) {
+      return;
+    }
+
+    const subtitleGroupId = levelInfo.subtitleGroupIds[levelInfo.urlId];
+
+    if (this._subtitleGroupId !== subtitleGroupId) {
+      this._subtitleGroupId = subtitleGroupId;
+
+      logger.log('set subtitle group id:', subtitleGroupId);
+
+      this._selectInitialSubtitleTrack();
+    }
+  }
+
   // Fired whenever a new manifest is loaded.
   onManifestLoaded (data) {
     let tracks = data.subtitles || [];
@@ -109,7 +177,7 @@ class SubtitleTrackController extends EventHandler {
     const { trackId, tracks } = this;
     const currentTrack = tracks[trackId];
     if (id >= tracks.length || id !== trackId || !currentTrack || this.stopped) {
-      this._clearReloadTimer();
+      this.clearInterval();
       return;
     }
 
@@ -117,11 +185,10 @@ class SubtitleTrackController extends EventHandler {
     if (details.live && !this.stopped) {
       const reloadInterval = computeReloadInterval(currentTrack.details, details, data.stats.trequest);
       logger.log(`Reloading live subtitle playlist in ${reloadInterval}ms`);
-      this.timer = setTimeout(() => {
-        this._loadCurrentTrack();
-      }, reloadInterval);
+      this.clearInterval();
+      this.setInterval(reloadInterval);
     } else {
-      this._clearReloadTimer();
+      this.clearInterval();
     }
   }
 
@@ -132,31 +199,60 @@ class SubtitleTrackController extends EventHandler {
 
   stopLoad () {
     this.stopped = true;
-    this._clearReloadTimer();
+    this.clearInterval();
   }
 
-  /** get alternate subtitle tracks list from playlist **/
+  onError (data) {
+    // TODO: implement similar failure handling logic as in audio-track-controller
+    //       -> for this we first need to declare some error codes for subtitle track loading
+    //          and also actually trigger such an error event in subtitle-stream-controller
+
+    // Only handle network errors
+    if (data.type !== ErrorTypes.NETWORK_ERROR) {
+      return;
+    }
+
+    // If fatal network error, cancel update task
+    if (data.fatal) {
+      this.clearInterval();
+    }
+
+    // If not an subs-track loading error don't handle further
+    if (data.details !== ErrorDetails.SUBTITLE_TRACK_LOAD_ERROR) {
+      return;
+    }
+
+    logger.warn('Network failure on subtitle-track id:', data.context.id);
+    this._handleLoadError();
+  }
+
+  /**
+   * @public
+   * @type {SubititleTrack[]}
+   */
   get subtitleTracks () {
     return this.tracks;
   }
 
+  /**
+   * @public
+   * @type {SubititleTrack}
+   */
   /** get index of the selected subtitle track (index in subtitle track lists) **/
   get subtitleTrack () {
     return this.trackId;
   }
 
+  /**
+   * @public
+   * @type {SubititleTrack}
+   */
   /** select a subtitle track, based on its index in subtitle track lists**/
   set subtitleTrack (subtitleTrackId) {
     if (this.trackId !== subtitleTrackId) {
       this._toggleTrackModes(subtitleTrackId);
-      this._setSubtitleTrackInternal(subtitleTrackId);
-    }
-  }
-
-  _clearReloadTimer () {
-    if (this.timer) {
-      clearTimeout(this.timer);
-      this.timer = null;
+      this._setSubtitleTrack(subtitleTrackId);
+      this._selectDefaultTrack = false;
     }
   }
 
@@ -168,6 +264,49 @@ class SubtitleTrackController extends EventHandler {
     }
     logger.log(`Loading subtitle track ${trackId}`);
     hls.trigger(Event.SUBTITLE_TRACK_LOADING, { url: currentTrack.url, id: trackId });
+  }
+
+  /**
+   * @private
+   * Called when we want to reselect the track based on current environment params have been updated,
+   * like wether we should fallback to default selection, or match the current level group id upon
+   * a level switch that involved a group-ID switch for subs.
+   */
+  _selectInitialSubtitleTrack () {
+    // loop through available subtitle tracks and autoselect default if needed
+    // TODO: improve selection logic to handle forced, etc
+
+    let selectedTrack = null;
+
+    const tracks = this.tracks.filter(
+      (track) => this._subtitleGroupId === null || track.groupId === this._subtitleGroupId
+    );
+
+    if (!tracks.length) {
+      return;
+    }
+
+    logger.log('Looking for selectable subtitle track...');
+
+    const defaultTracks = tracks.filter((track) => track.default);
+
+    if (this.selectDefaultTrack && defaultTracks.length) {
+      selectedTrack = defaultTracks[0];
+    } else if (tracks.length) {
+      selectedTrack = tracks[0];
+    } else {
+      logger.warn('No selectable subtitle tracks found');
+      return;
+    }
+
+    logger.log(`Selecting subtitle track id: ${selectedTrack.id}, name: ${selectedTrack.name}, group-ID: ${selectedTrack.groupId}`);
+
+    if (this.media) {
+      this._toggleTrackModes(selectedTrack.id);
+      this._setSubtitleTrack(selectedTrack.id);
+    } else {
+      this._queuedDefaultTrack = selectedTrack.id;
+    }
   }
 
   /**
@@ -202,17 +341,21 @@ class SubtitleTrackController extends EventHandler {
   }
 
   /**
-     * This method is responsible for validating the subtitle index and periodically reloading if live.
-     * Dispatches the SUBTITLE_TRACK_SWITCH event, which instructs the subtitle-stream-controller to load the selected track.
-     * @param newId - The id of the subtitle track to activate.
-     */
-  _setSubtitleTrackInternal (newId) {
+   * @private
+   * Dispatches the SUBTITLE_TRACK_SWITCH event, which instructs the subtitle-stream-controller to load the selected track.
+   * @param newId - The id of the subtitle track to activate.
+   */
+  _setSubtitleTrack (newId) {
     const { hls, tracks } = this;
+
     if (!Number.isFinite(newId) || newId < -1 || newId >= tracks.length) {
       return;
     }
 
+    // stopping live reloading timer if any
+    this.clearInterval();
     this.trackId = newId;
+
     logger.log(`Switching to subtitle track ${newId}`);
     hls.trigger(Event.SUBTITLE_TRACK_SWITCH, { id: newId });
     this._loadCurrentTrack();
@@ -239,18 +382,43 @@ class SubtitleTrackController extends EventHandler {
     // Setting current subtitleTrack will invoke code.
     this.subtitleTrack = trackId;
   }
-}
 
-function filterSubtitleTracks (textTrackList) {
-  let tracks = [];
-  for (let i = 0; i < textTrackList.length; i++) {
-    const track = textTrackList[i];
-    // Edge adds a track without a label; we don't want to use it
-    if (track.kind === 'subtitles' && track.label) {
-      tracks.push(textTrackList[i]);
+  /**
+   * @private
+   */
+  _handleLoadError () {
+    // add current track id to restricted list
+    this.restrictedTracks[this.trackId] = true;
+
+    // try to fall back on a functional audio-track with the same group ID
+    const previousId = this.trackId;
+    const { name, language, groupId } = this.tracks[previousId];
+
+    logger.warn(`Loading failed on subtitle track id: ${previousId}, group-id: ${groupId}, name/language: "${name}" / "${language}"`);
+
+    // Find a non-restricted track ID with the same NAME
+    // At least a track that is not restricted, thus on another group-ID.
+    let newId = previousId;
+    for (let i = 0; i < this.tracks.length; i++) {
+      if (this.restrictedTracks[i]) {
+        continue;
+      }
+      const newTrack = this.tracks[i];
+      if (newTrack.name === name) {
+        newId = i;
+        break;
+      }
     }
+
+    if (newId === previousId) {
+      logger.warn(`No fallback subtitle-track found for name/language: "${name}" / "${language}"`);
+      return;
+    }
+
+    logger.log('Attempting subtitle-track fallback id:', newId, 'group-id:', this.tracks[newId].groupId);
+
+    this._setSubtitleTrack(newId);
   }
-  return tracks;
 }
 
 export default SubtitleTrackController;

@@ -5,7 +5,7 @@ import {
   ErrorDetails
 } from './errors';
 
-import PlaylistLoader from './loader/playlist-loader';
+import { PlaylistLoader } from './loader/playlist-loader';
 import FragmentLoader from './loader/fragment-loader';
 import KeyLoader from './loader/key-loader';
 
@@ -21,6 +21,7 @@ import { hlsDefaultConfig, HlsConfig } from './config';
 import HlsEvents from './events';
 
 import { Observer } from './observer';
+import { PlaylistLevelType } from './types/loader';
 
 /**
  * @module Hls
@@ -687,6 +688,113 @@ export default class Hls extends Observer {
     const subtitleTrackController = this.subtitleTrackController;
     if (subtitleTrackController) {
       subtitleTrackController.subtitleDisplay = value;
+    }
+  }
+
+  /**
+   * @returns {QualityLevel}
+   */
+  getActiveQualityLevel () {
+    return this.levels[this.currentLevel];
+  }
+
+  /**
+   * @returns {AudioTrack[]}
+   */
+  getAudioGroupTracks () {
+    const level = this.getActiveQualityLevel();
+    if (!level) {
+      return [];
+    }
+
+    const currentGroupId = level.audioGroupIds ? level.audioGroupIds[level.urlId] : null;
+    if (!currentGroupId) {
+      return this.audioTracks;
+    }
+
+    return this.audioTracks.filter((track) => track.groupId === currentGroupId);
+  }
+
+  /**
+   * @returns {SubtitleTrack[]}
+   */
+  getSubtitleGroupTracks () {
+    const level = this.getActiveQualityLevel();
+    if (!level) {
+      return [];
+    }
+
+    const currentGroupId = level.subtitleGroupIds ? level.subtitleGroupIds[level.urlId] : null;
+    if (!currentGroupId) {
+      return this.subtitleTracks;
+    }
+
+    return this.subtitleTracks.filter((track) => track.groupId === currentGroupId);
+  }
+
+  /**
+   *
+   * @param {string} name Relates to NAME attribute of alternate media.
+   * @param {string} language Relates to LANGUAGE attribute of alternate media. Optional, ignored when null
+   * @returns {boolean} True if track was selected matching preferences
+   */
+  setPreferredAudioOptions (name, language = null) {
+    return this._setPreferredMediaOptions(PlaylistLevelType.AUDIO, name, language);
+  }
+
+  /**
+   *
+   * @param {string} name Relates to NAME attribute of alternate media.
+   * @param {string} language Relates to LANGUAGE attribute of alternate media. Optional, ignored when null
+   * @returns {boolean} True if track was selected matching preferences
+   */
+  setPreferredSubtitleOptions (name, language = null) {
+    return this._setPreferredMediaOptions(PlaylistLevelType.SUBTITLE, name, language);
+  }
+
+  /**
+   * @private
+   * @param {'audio' | 'subtitle'} mediaType
+   * @param {string} name
+   * @param {string} language Optional, ignored when null
+   * @returns {boolean} True if track was selected matching preferences
+   */
+  _setPreferredMediaOptions (mediaType, name, language = null) {
+    let tracks;
+    switch (mediaType) {
+    case PlaylistLevelType.AUDIO:
+      tracks = this.getAudioGroupTracks();
+      break;
+    case PlaylistLevelType.SUBTITLE:
+      tracks = this.getSubtitleGroupTracks();
+      break;
+    default:
+      throw new Error('Internal asssertion failed, not a media-type: ' + mediaType);
+    }
+
+    const trackOption = tracks
+      .filter((track) => {
+        if (name === track.name &&
+          (language === null || language === track.lang)) {
+          return true;
+        }
+        return false;
+      })[0];
+    if (trackOption) {
+      switch (mediaType) {
+      case PlaylistLevelType.AUDIO:
+        this.audioTrack = trackOption.id;
+        break;
+      case PlaylistLevelType.SUBTITLE:
+        this.subtitleTrack = trackOption.id;
+        break;
+      default:
+        throw new Error('Internal asssertion failed, not a media-type: ' + mediaType);
+      }
+      return true;
+    } else {
+      logger.warn(`Could not find any ${mediaType}-track in current-level respective media-group matching name="${name}" and language="${language}"`);
+      return false;
     }
   }
 }
