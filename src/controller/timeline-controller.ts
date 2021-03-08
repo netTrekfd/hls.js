@@ -380,7 +380,8 @@ class TimelineController extends EventHandler {
   }
 
   _parseVTTs (frag: Fragment, payload: ArrayBuffer) {
-    const { hls, prevCC, textTracks, vttCCs } = this;
+    const { hls, prevCC, vttCCs } = this;
+
     if (!vttCCs[frag.cc]) {
       vttCCs[frag.cc] = { start: frag.start, prevCC, new: true };
       this.prevCC = frag.cc;
@@ -388,7 +389,7 @@ class TimelineController extends EventHandler {
     // Parse the WebVTT file contents.
     WebVTTParser.parse(payload, this.initPTS[frag.cc], vttCCs, frag.cc, (cues) => {
       if (this.config.renderTextTracksNatively) {
-        const currentTrack = textTracks[frag.level];
+        const currentTrack = this.media?.textTracks[frag.level]!;
         // WebVTTParser.parse is an async method and if the currently selected text track mode is set to "disabled"
         // before parsing is done then don't try to access currentTrack.cues.getCueById as cues will be null
         // and trying to access getCueById method of cues will throw an exception
